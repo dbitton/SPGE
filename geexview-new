@@ -1,0 +1,477 @@
+#!/usr/local/bin/perl -wT
+#########
+# Author: rmp
+# Maintainer: rmp
+# Created: 2002-06-25
+# Last Modified: 2002-10-14
+# S.pombe Gene Expression viewer
+#
+package SPGE::geexview;
+use strict;
+
+use lib '/cgi-bin/SPGE/modules';
+#use lib '/nfs/WWWdev/SANGER_docs/perl/SPGE/modules';
+use lib qw(/var/www/lib/core);
+
+#use SangerPaths qw(core bioperl ensembl); # spge);
+use GD;
+use CGI qw/:cgi/;
+use CGI::Carp qw(fatalsToBrowser);
+
+use Getopt::Long;
+use SangerWeb;
+#use Sanger::Graphics::JSTools;
+use SPGE::WebUserConfig::geexview;
+use SPGE::WebUserConfig::geexview_group;
+use SPGE::WebUserConfig::geexview_key;
+use SPGE::DrawableContainer;
+use SPGE::Experiment;
+use SPGE::GeneSynonym;
+use SPGE::ExperimentGroup;
+use Spreadsheet::WriteExcel;
+use Website::Utilities::IdGenerator;
+use vars qw($TMPURI $TMPDIR $EMPOWERED);
+
+use Data::Dumper;
+
+BEGIN {
+  @INC = grep { $_ !~ m!/nfs/WWW/SANGER_docs/perl/SPGE/modules! } @INC;
+#  push @INC, '/nfs/WWWdev/SANGER_docs/perl/SPGE/modules';
+}
+
+print STDERR "[@INC]\n";
+
+$TMPURI    = "/tmp/spge";
+$TMPDIR    = $ENV{'DOCUMENT_ROOT'} . $TMPURI;
+$EMPOWERED = qq(<p align="right"><a href="http://www.ensembl.org/ensemblpowered.html"><img src="/gfx/empowered-small.png" alt="Powered by Ensembl" border="" /></a></p>\n);
+
+sub main {
+  my $cgi        = CGI->new();
+
+  if(!defined $ENV{'SCRIPT_NAME'}) {
+    my ($gn, $experiment, $act, $format, $match);
+    &GetOptions(
+		"exp_name=s"  => \$experiment,
+		"q=s"         => \$gn,
+		"action=s"    => \$act,
+		"format=s"    => \$format,
+		"match=s"     => \$match,
+	       );
+    $cgi->param('exp_name',  $experiment);
+    $cgi->param('q',         $gn);
+    $cgi->param('action',    $act);
+    $cgi->param('format',    $format);
+    $cgi->param('match',     $match);
+  }
+
+  my $action          = $cgi->param('action')     || "";
+  my @pgene_names     = $cgi->param('q');
+  my $experiment_name = $cgi->param('exp_name');
+  my $match_type      = $cgi->param('match')      || "exact";
+  my $scale_type      = $cgi->param('scale')      || "log2";
+  my $format          = $cgi->param('format')     || "html";
+  my $nodecor         = $cgi->param('nodecor');
+  my $groupid         = $cgi->param('group');
+  my $scale_auto      = $cgi->param('scale_auto') || "off";
+  my $scale_min       = $cgi->param('scale_min')  || -2;
+  my $scale_max       = $cgi->param('scale_max')  || 2;
+  my $scriptname      = $ENV{'SCRIPT_NAME'};
+  $scriptname         =~ s/\/\//\//g;
+  my @gene_names      = ();
+  
+  for my $pg (@pgene_names) {
+    my ($clean_pg) = $pg =~ /([a-zA-Z0-9:\-\|\.,_ ]+)/g;
+    next if(!defined $clean_pg);
+    push @gene_names, grep { ($match_type ne "exact")?length($_) >= 3:1 } split(/[\|,]/, $clean_pg);
+  }
+
+  my $sw_refs = {
+		 'title'            => qq(S.pombe Gene Expression Viewer),
+		 'banner'           => qq(<i>S.pombe</i> Gene Expression Viewer),
+		 'author'           => 'rmp',
+		 'jsfile'           => qq(/js/zmenu.js),
+		 'description'      => qq(S.pombe Gene Expression Viewer),
+		 'inifile'          => qq($ENV{'DOCUMENT_ROOT'}/PostGenomics/S_pombe/header.ini),
+		};
+
+  if($action eq "export" && $format eq "printable") {
+    $nodecor = 1;
+    $action  = "";
+  }
+
+
+  if(defined $nodecor || $action eq "help") {
+    $sw_refs->{'decor'} = "half";
+  }
+
+  if($ENV{'QUERY_STRING'} ne "") {
+    $sw_refs->{'navigator2'} .= qq(,Printable Page||$ENV{'REQUEST_URI'}&nodecor=1);
+  }
+  
+  my $sw = SangerWeb->new($sw_refs);
+
+  if($action eq "export") {
+
+    my $mime = "text/plain";
+    if($format eq "html") {
+      $mime = "text/html";
+
+    } elsif($format eq "xls") {
+      $mime = "application/vnd.ms-excel";
+    }
+
+    if($format eq "html") {
+      print $sw->header();
+    } else {
+      print qq(Content-type: $mime\n\n);
+    }
+
+    &export($cgi, &x_gene_names(\@gene_names, $match_type), $format, $sw);
+
+    print $EMPOWERED, $sw->footer() if($format eq "html");
+
+  } elsif($action eq "help") {
+    print $sw->header();
+
+    &help($cgi);
+    
+    print $EMPOWERED, $sw->footer();
+
+  } else {
+    print $sw->header();
+#    print "\n", &js_menu_div(), "\n";
+    print qq(<img src="/gfx/close.gif" width="0" height="0" alt="" />\n);
+
+    my @groups    = SPGE::ExperimentGroup->groups();
+    my $gene_name = join(',', @gene_names);
+
+    print qq(
+<form action="$scriptname" method="POST">
+<table border="0" align="center" class="violet1">
+  <tr>
+    <td class="smarial">Experiment</td>
+    <td>
+      <select name="group">\n);
+
+    $groupid ||= $groups[0]->id();
+    for my $group (@groups) {
+      my $id       = $group->id();
+      my $desc     = $group->description();
+      my $selected = "";
+      $selected    = "selected" if($id == $groupid);
+      print qq(\t<option value="$id" $selected>$desc</option>\n);
+    }
+
+    print qq(
+      </select>
+    </td>
+    <td colspan="2" class="smarial" align="right">[<a href="/PostGenomics/S_pombe/projects/citation.shtml" target="geexviewhelp">How to cite these data</a>] [<a href="$scriptname?action=help" target="geexviewhelp">Help</a>]</td>
+  </tr>
+  <tr>
+    <td class="smarial">Gene name</td>
+    <td><input type="entry" name="q" value="$gene_name"></td>
+  </tr>
+  <tr>\n);
+    #########
+    # match type
+    #
+    print qq(<td class="smarial">match type\n<select name="match">\n);
+    for my $f (qw(exact partial)) {
+      my $selected = "";
+      $selected = "selected" if($match_type eq $f);
+      print qq(  <option value="$f" $selected>$f</option>\n);
+    }
+    print qq(</select></td>\n);
+
+    #########
+    # scale type
+    #
+    print qq(<td class="smarial">scale type\n<select name="scale">\n);
+    for my $f (qw(linear log10 log2 loge)) {
+      my $selected = "";
+      $selected = "selected" if($scale_type eq $f);
+      print qq(  <option value="$f" $selected>$f</option>\n);
+    }
+    print qq(</select></td>\n);
+
+    print qq(<input type="hidden" name="nodecor" value="1">\n) if(defined $nodecor);
+
+    print qq(<td class="smarial">
+  <input type="submit" name="action" value="display"> or</td><td class="smarial">
+  <input type="submit" name="action" value="export">
+  as
+  <select name="format">
+    <option value="html">HTML tables</option>
+    <option value="csv">Comma-separated text</option>
+    <option value="tsv">Tab-separated text</option>
+    <option value="xls">Excel workbook</option>
+    <option value="printable">Printable Page</option>
+  </select></td>
+  </tr>
+  <tr>
+    <td colspan="3">
+      Scale auto <input type="checkbox" name="scale_auto" value="on" @{[($scale_auto eq "on")?"checked":""]} />
+      or set manually to 
+      min=<input type="text" size="4" name="scale_min" value="$scale_min" />
+      and max=<input type="text" size="4" name="scale_max" value="$scale_max" />
+    </td>
+  </tr>
+</table>
+</form>
+);
+
+    my $q = $cgi->param('q');
+    if(defined $q && length($q) < 3 && $match_type ne "exact") {
+      print qq(Your search term is too short for partial matching. Please try again.);
+
+    } elsif(scalar @gene_names > 0) {
+
+      my $x_gene_ref = &x_gene_names(\@gene_names, $match_type);
+      if(scalar @{$x_gene_ref} <= 0) {
+	print qq(No matches found for '<b>$q</b>'.<br />\n);
+
+      } else {
+	# wild type diploid meiosis
+	# pat1 diploid meiosis
+	# add link to /PostGenomics/S_pombe/projects/sexualdifferentiation/experiments.shtml
+
+	my $group = SPGE::ExperimentGroup->new({
+						'id'         => $groupid,
+						'gene_names' => $x_gene_ref,
+					       });
+
+	print &draw($cgi, $group, $x_gene_ref);
+
+	$cgi->param('key', 1);
+
+	print &draw($cgi, ($group->experiments())[0], $x_gene_ref);
+
+      }
+    }
+    print $EMPOWERED, $sw->footer();
+  }
+}
+
+sub draw {
+  my ($cgi, $container, $x_gene_ref) = @_;
+
+  if($container->can("groupstyle") && $container->groupstyle() == 1) {
+    for my $experiment ($container->experiments()) {
+      print &draw($cgi, $experiment, $x_gene_ref);
+    }
+    return "";
+  }
+
+  my $image_type = (GD::Image->can("png")) ? 'png' : 'gif';
+  my $scale_type = $cgi->param('scale')      || "linear";
+  my $scale_auto = $cgi->param('scale_auto') || "off";
+  my $scale_min  = $cgi->param('scale_min')  || -2;
+  my $scale_max  = $cgi->param('scale_max')  || 2;
+  my $log_base   = 10;
+  my $groupid    = $container->id() if($container->isa("SPGE::ExperimentGroup"));
+  my $group      = $groupid?"_group":"";
+  my $config     = undef;
+
+  if(defined $cgi->param('key')) {
+    $config = SPGE::WebUserConfig::geexview_key->new();
+
+  } else {
+    if(substr($scale_type, 0, 3) eq "log") {
+      ($scale_type, $log_base) = $scale_type =~ /^(log)(.*)$/g;
+    }
+
+    if(defined $groupid) {
+      $config = SPGE::WebUserConfig::geexview_group->new();
+      
+    } else {
+      $config = SPGE::WebUserConfig::geexview->new();
+    }
+
+    my $gid = $container->isa("SPGE::ExperimentGroup")?$groupid:$container->experiment_group_id();
+
+    $config->{'general'}->{'geexview'}->{"SPGE_expression$group"}->{'scale'}      = $scale_type;
+    $config->{'general'}->{'geexview'}->{"SPGE_expression$group"}->{'log_base'}   = $log_base;
+    $config->{'general'}->{'geexview'}->{"SPGE_expression$group"}->{'scale_auto'} = $scale_auto;
+    $config->{'general'}->{'geexview'}->{"SPGE_expression$group"}->{'scale_min'}  = $scale_min;
+    $config->{'general'}->{'geexview'}->{"SPGE_expression$group"}->{'scale_max'}  = $scale_max;
+    $config->{'general'}->{'geexview'}->{"SPGE_meiosis"}->{'label'}               = {
+										     1 => "meiotic stage",
+										     2 => "",
+										     3 => "cell cycle phase",
+                                                                                     4 => "experimental repeats"
+										    }->{$gid} || ""; # BAD BAD BAD!! Query the db for this sort of data!
+  }
+
+  $config->{'cgi'} = $cgi;
+  $config->container_width($container->length());
+
+  my $fout;
+  my ($fpath) = $TMPDIR =~ m|([a-zA-Z0-9_\-/\.]+)|;
+  my $id      = Website::Utilities::IdGenerator->get_unique_id();
+  my $dc      = SPGE::DrawableContainer->new($container, $config);
+  $fpath     .= "/$id.$image_type";
+
+  open($fout, ">$fpath") or die qq($fpath: $!);
+  binmode($fout);
+  print $fout $dc->render($image_type);
+  close($fout);
+
+  my $content = qq(<map name="$id">\n) . $dc->render("imagemap") . qq(</map>\n);
+  $content   .= qq(<center><img src="$TMPURI/$id.$image_type" border="0" alt="Expression Profile" usemap="#$id" /></center><br />);
+  return $content;
+}
+
+sub export {
+  my ($cgi, $genes_ref, $format, $sw) = @_;
+
+  my $workbook = undef;
+  $workbook    = Spreadsheet::WriteExcel->new(\*STDOUT) if($format eq "xls");
+  my $groupid  = $cgi->param('group');
+  my $group    = SPGE::ExperimentGroup->new({
+					     'id'         => $groupid,
+					     'gene_names' => $genes_ref,
+					    });
+
+  for my $experiment ($group->experiments()) {
+    my $exname     = $experiment->name();
+    my $text_delim = "\t";
+    if($format eq "csv") {
+      $text_delim = ",";
+      $format = "tsv";
+    }
+
+    if($format eq "html") {
+      #########
+      # HTML fancy
+      #
+      my $violet = 2;
+      print qq(
+<table border="0" cellspacing="0" cellpadding="2">
+  <tr class="violet3"valign="top">
+    <th align="right" class="barial">Experiment</th>
+    <td class="smarial">$exname</td>
+  </tr>
+  <tr class="violet1" valign="top">
+    <th align="right" class="barial">Points</th>);
+      print '<td class="smarial">', join('</td><td class="smarial">', map { $_=$_->time() ; $_ = "veg" if($_ < 0); $_; } $experiment->time_points()), "</td>\n  </tr>\n";
+
+      for my $gene ($experiment->genes()) {
+	print qq(<tr class="violet$violet"valign="top"><td class="smarial">), $gene->name(), "</td>";
+	print '<td class="smarial">', join('</td><td class="smarial">', map { $_=$_->data() ; $_ ||= 0;} $gene->expressions()), "</td>\n  </tr>\n";
+	$violet = 1+!($violet-1);
+      }
+
+      print qq(</table><br />\n);
+
+    } elsif($format eq "xls") {
+      my $worksheet = $workbook->addworksheet($exname);
+      $worksheet->write(0,0, "Points");
+
+      my $i = 1;
+      for my $p (map { $_=$_->time() } $experiment->time_points()) {
+	$worksheet->write_number(0,$i, $p);
+	$i++;
+      }
+
+      my $row = 1;
+      for my $gene ($experiment->genes()) {
+	$worksheet->write($row, 0, $gene->name());
+	my $col = 1;
+	for my $e (map { $_=$_->data() ; $_ ||= 0;} $gene->expressions()) {
+	  $worksheet->write_number($row,$col, $e);
+	  $col++;
+	}
+	$row++;
+      }
+
+    } else {
+      #########
+      # Plain text (tsv/csv)
+      #
+      print qq(Experiment$text_delim$exname\n);
+      print qq(Points$text_delim), join($text_delim, map { $_=$_->time() ; $_ = "veg" if($_ < 0); $_; } $experiment->time_points()), "\n";
+      for my $gene ($experiment->genes()) {
+	print $gene->name(), "${text_delim}";
+	print join("${text_delim}", map { $_=$_->data() ; $_ ||= 0;} $gene->expressions()), "\n";
+      }
+      print "\n\n";
+    }
+  }
+}
+
+
+sub x_gene_names {
+  my ($gene_names_ref, $match_type) = @_;
+  my @x_gene_names = ();
+
+  #########
+  # more specific results first
+  #
+  for my $xg (@{$gene_names_ref}) {
+    push @x_gene_names, sort SPGE::GeneSynonym->new({
+						     'name'  => $xg,
+						     'fuzzy' => ($match_type eq "partial")?1:undef,
+						    })->gene_names();
+  }
+
+  #########
+  # now synonyms
+  #
+  for my $xg (@{$gene_names_ref}) {
+    push @x_gene_names, sort SPGE::GeneSynonym->new({
+						     'synonym' => $xg,
+						     'fuzzy'   => ($match_type eq "partial")?1:undef,
+						    })->gene_names();
+  }
+
+#  my @tmp = @x_gene_names[0..19];
+  return \@x_gene_names;
+#  return \@tmp;
+}
+
+sub help {
+  print qq(
+<h3 align="center">Help</h3>
+
+<a name="searching"><h4>Searching for genes</h4></a>
+<p>
+  <ul>
+    <li>Enter your gene name in the box marked '<b>gene name</b>' and press '<b>display</b>'.</li>
+    <li>To display more than one gene enter a comma or pipe '|' separated list e.g. '<b>act1,pap1</b>'.</li>
+    <li>To search for partial gene names change the '<b>match type</b>' to '<b>partial</b>'. Partial matching also applies to multiple names, e.g. '<b>rps,rpn</b>'</li>
+  </ul>
+</p>
+<a name="expressionscale"><h4>Expression Scale</h4></a>
+<p>
+  <ul>
+    <li>The expression ratio track can be scaled in four ways:
+      <ul>
+	<li>linear</li>
+        <li>log<sub><small>10</small></sub>(ratio)</li>
+        <li>log<sub><small>2</small></sub>(ratio)</li>
+        <li>log<sub><small>e</small></sub>(ratio)</li>
+      </ul>
+     </li>
+  </ul>
+</p>
+<a name="exportingdata"><h4>Exporting Data</h4></a>
+<p>
+  The expression data from a display can be exported (dumped) in three ways:
+  <ul>
+    <li>HTML marked up</li>
+    <li>Tab-separated text</li>
+    <li>Comma-separated text</li>
+  </ul>
+  After executing a search for your gene(s) of interest, select your preferred export format and press '<b>export</b>'.
+</p>
+<a name="printablepage"><h4>Printer-Friendly version</h4></a>
+<p>
+  For a printer-friendly formatted page, use the '<b>Printable Page</b>' link from the sidebar.
+</p>
+);
+}
+
+
+1;
+
+SPGE::geexview::main();
